@@ -36,6 +36,9 @@
 | N27 | 无 VisibilityMap | knl_uvacuumlazy.cpp:650 注释 | "UStore don't have VisibilityMap"——无 all-visible 快路径,旁路清理里 newRelAllvisible 恒 0 |
 | N28 | VACUUM×UNDO 耦合 | LazyScanUHeap 注释 [:170-189](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L170-L189) | ① 判死需 undo 链遍历(丢弃进度影响判死);② 回收行指针时 VACUUM 自身写 undo(有索引时);③ TID 复用保护:标记 unused 的行指针打包 TD 槽信息,VACUUM 事务提交前 TID 不复用 |
 | N29 | 扫描接口面 | TableAmRoutine [tableam.cpp:1161](../../../../../src/gausskernel/storage/access/table/tableam.cpp#L1161) + [knl_uscan.h:26](../../../../../src/include/access/ustore/knl_uscan.h#L26) | 一套 TableScanDesc 接口承载多模式:scan_begin(顺序)/begin_bm(位图)/begin_sampling(TABLESAMPLE)/begin_parallel(并行)/index_fetch_*(索引回表)/tuple_fetch_row_version(TID 扫描);UHeapScanDescData 用 rs_bitmapscan/rs_samplescan/rs_parallel/dop 标志复用同一机制 |
+| N30 | DML 的 undo 生成点 | Insert→UHeapPrepareUndoInsert [knl_uheap.cpp:646](../../../../../src/gausskernel/storage/access/ustore/knl_uheap.cpp#L646)/MultiInsert [:3510](../../../../../src/gausskernel/storage/access/ustore/knl_uheap.cpp#L3510);Delete→UHeapPrepareUndoDelete [:2227](../../../../../src/gausskernel/storage/access/ustore/knl_uheap.cpp#L2227) | **每条 INSERT/DELETE/原位 UPDATE 都写 undo**:insert 记录"新插入"事实(回滚删除+abort 判定),delete/update 保存旧元组数据;频繁 DML ⇒ undo 线性增长,至 undo_retention_time 过期由 Recycler 回收 |
+| N31 | undo 链的物理形态 | GetPrevUrp [knl_uundoapi.cpp:749](../../../../../src/gausskernel/storage/access/ustore/undo/knl_uundoapi.cpp#L749) + GetPrevRecordLen [knl_uundorecord.cpp:201](../../../../../src/gausskernel/storage/access/ustore/knl_uundorecord.cpp#L201) | 同一事务的 undo 记录在 log 中**物理连续**:每条记录尾部存前一条的长度(2B),回溯 = 当前偏移−prevLen;页上 TD 槽(16B:xactid+UndoRecPtr)指向该事务在该页的最新记录,由此进入链头;跨事务版本链靠 DELETE/UPDATE 记录携带的 TD 信息(need_old_xact_info)串接 |
+| N32 | undo 观测函数族 | [pgundostatfuncs.cpp](../../../../../src/common/backend/utils/adt/pgundostatfuncs.cpp)(单机模式,分布式报不支持) | gs_stat_undo(全局水位)/gs_undo_meta(zone 级 insert/update/delete 计数)/gs_undo_translot(事务槽列表)/gs_undo_translot_dump_xid(按 xid 走链)/gs_undo_dump_record·gs_undo_dump_xid(逐记录 dump)/gs_undo_dump_parsepage_mv(页面 MVCC 解析);用法样例:src/test/regress/sql/test_ustore_undo_tool.sql |
 
 ## 二、关系边
 
@@ -63,6 +66,10 @@
 | N18 | N24 | 制约 | RP_REDIRECT 行需 undo 已丢弃才能由 VACUUM 回收,回收进度与 UndoRecycler 联动 |
 | N18 | N26 | 输入 | globalRecycleXid 驱动旁路 VACUUM 的 frozenxid 推进 |
 | N25 | N20 | 记日志 | LogUHeapClean 为 Ustore 专属 WAL 记录 |
+| N30 | N31 | 写入 | 同事务连续 DML 的 undo 记录物理相邻,TD 槽指向链头(最新记录) |
+| N31 | N14 | 寻址 | 链的起止由事务槽(MiniSlot)的 start/end URP 界定 |
+| N32 | N31 | 解析 | dump 函数复用 GetPrevUrp 走链逻辑 |
+| N32 | N18 | 观测 | gs_undo_meta/translot 反映 Recycler 回收进度 |
 
 ## 三、设计取舍场景(2026-10-09 深化分析)
 
@@ -101,6 +108,25 @@
 - **非原位=astore 行为回归**:旧版本留页(UHEAP_UPDATED+ctid 指新位置)→ 膨胀回归靠 VACUUM(S5);新元组 `RelationGetBufferForUTuple` 选页,同页放不下跨页 [:2835](../../../../../src/gausskernel/storage/access/ustore/knl_uheap.cpp#L2835);ctid 变→索引列被改时需更新索引(原位更新 ctid 不变、索引免更新,是 ustore 核心优势)
 - **边界**:变长缩小仍原位;同大小变长原位+XOR 差量 undo;跨分区更新走 delete+insert;TD 槽不足是等待重试非劣化;`useLinkUpdate`(链接更新)预留机制,树内无置 true 路径
 
+### S7 频繁 INSERT/DELETE 的 undo 链与观测(2026-10-10)
+- **会否产生 undo**:会。每条 INSERT 写 URecHeapInsert 型 undo(N30),每条 DELETE 写 URecHeapDelete 型(旧元组全量入 undo);频繁 DML ⇒ undo 空间线性增长,**但不是泄漏**——事务提交后经过 undo_retention_time(默认按 GUC)由 UndoRecycler 异步回收,水位回落
+- **链形态**:同事务内记录物理连续、尾存 prevLen 回溯;页 TD 槽→该事务该页最新记录;跨事务版本链靠 delete/update 记录携带的 TD 信息
+- **观测路径**(单机模式,分布式 ereport 不支持):
+  ```sql
+  -- ① 全局水位与回收状态
+  SELECT * FROM gs_stat_undo();
+  -- ② zone 级计数(注意 insert/update/delete 计数与空间占用)
+  SELECT * FROM gs_undo_meta(0, true, true);
+  -- ③ 事务槽列表:每个产生 DML 的 xact 一行(xid/起止 URP)
+  SELECT * FROM gs_undo_translot(0, true);
+  -- ④ 按事务走链:从该 xact 最新记录回溯列出全部 undo 记录
+  SELECT * FROM gs_undo_dump_xid(<xid>);
+  -- ⑤ 单条记录内容(类型、目标页/offset、旧元组)
+  SELECT * FROM gs_undo_dump_record(<urp>);
+  ```
+- **演示**:会话 A `BEGIN;` 循环 INSERT+DELETE 不提交 → 会话 B 查 ②③ 可见本 xact 的 undo 增长;A 回滚后可见性靠这些 undo 判 abort(呼应 S3 回滚廉价);A 提交等待 retention 过期后再查 ②,计数回落
+- **回归样例**:`src/test/regress/sql/test_ustore_undo_tool.sql`(undo 工具函数用法全集)
+
 ## 四、测试场景(2026-10-09)
 
 T1-T8 测试集见 [tests/ustore_vacuum_test.sql](tests/ustore_vacuum_test.sql),与 S5 机制一一对应:
@@ -124,3 +150,4 @@ T1-T8 测试集见 [tests/ustore_vacuum_test.sql](tests/ustore_vacuum_test.sql),
 - [ ] opfusion 对 Ustore 的旁路条件
 - [ ] UBTree 与 UNDO_UBT_* 记录的联动
 - [ ] undo zone 绑定会话的分配策略(numa/threadpool 场景)
+- [ ] UndoRecycler 回收水位推进细节(globalRecycleXid 与 undo_retention_time 的精确交互,呼应 S7)
