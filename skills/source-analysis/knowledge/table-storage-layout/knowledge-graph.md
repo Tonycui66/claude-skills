@@ -88,6 +88,18 @@
 
 **TOAST 常量**(N5/N6):触发阈值 astore 2032B / ustore 2008B;chunk 1996B;例:10240B text → 1 主壳 + 6 chunk = 7 tuple。
 
+### S4 SQL 数据类型字节数速查(2026-10-12,typlen 取自 [pg_type.h](../../../../../src/include/catalog/pg_type.h) DATA 行实证)
+
+**定长类型**:tinyint 1 / smallint 2 / integer 4 / bigint 8 / real·float4 4 / double precision·float8 8 / money 8 / bool 1 / uuid 16 / macaddr 6 / date 4 / time 8 / timetz 12 / timestamp·timestamptz·**smalldatetime 8**(pg_type.h:764,typlen=8 FLOAT8 存储,注意≠SQL Server 的 4B)/ interval 16 / abstime·reltime 4(遗留) / name 64(目录内部) / tid 6。timestamp(p) 精度不改字节数。
+
+**变长类型(typlen=-1,varlena)**:varchar(n)/varchar2、bpchar·char(n)(空格填充)、text/clob、bytea/raw/blob、numeric(p,s)、json/jsonb/xml、inet/cidr、bit/varbit、数组。
+- varlena 头:总长≤127B 且未压缩 → **1B 头**;否则 **4B 头**;页内再 MAXALIGN(8)
+- varchar(n) 的 n 是**字符数**(UTF8 中文 3B/字),上限 10485760
+- numeric(p,s) ≈ 8B 头 + 每 4 位数字 2B:numeric(10,2)≈13B
+- 示例:'abc' in varchar(10) → 1+3=4B(短头);'你好' → 1+6=7→对齐 8B;timestamp 固定 8B
+
+**行占用示例**:ustore 行 = 元组头 11B + 各列 MAXALIGN 后累加 + 行指针 4B(见 S1 公式);astore 行头 23B 起。
+
 ## 四、待深入
 
 - [ ] 变长列对齐细节(short varlena 1B 头 vs 4B 头在行内的实际偏移计算)
