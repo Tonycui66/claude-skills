@@ -40,6 +40,7 @@
 | N31 | undo 链的物理形态 | GetPrevUrp [knl_uundoapi.cpp:749](../../../../../src/gausskernel/storage/access/ustore/undo/knl_uundoapi.cpp#L749) + GetPrevRecordLen [knl_uundorecord.cpp:201](../../../../../src/gausskernel/storage/access/ustore/knl_uundorecord.cpp#L201) | 同一事务的 undo 记录在 log 中**物理连续**:每条记录尾部存前一条的长度(2B),回溯 = 当前偏移−prevLen;页上 TD 槽(16B:xactid+UndoRecPtr)指向该事务在该页的最新记录,由此进入链头;跨事务版本链靠 DELETE/UPDATE 记录携带的 TD 信息(need_old_xact_info)串接 |
 | N32 | undo 观测函数族 | [pgundostatfuncs.cpp](../../../../../src/common/backend/utils/adt/pgundostatfuncs.cpp)(单机模式,分布式报不支持) | gs_stat_undo(全局水位)/gs_undo_meta(zone 级水位)/gs_undo_translot(事务槽列表)/gs_undo_translot_dump_xid(按 xid 走链)/gs_undo_dump_record·gs_undo_dump_xid(逐记录 dump)/gs_undo_dump_parsepage_mv(页面 MVCC 解析);签名均为数字参数:**gs_undo_meta(type,zoneId,location)** type∈{0=zone,1=translot组,2=undoSpace,3=slotSpace} location∈{0=共享内存,1=磁盘};**gs_undo_translot(type,zoneId)**;用法样例:src/test/regress/sql/test_ustore_undo_tool.sql |
 | N33 | undo 水位体系 | gs_stat_undo 列 [pgundostatfuncs.cpp:702-786](../../../../../src/common/backend/utils/adt/pgundostatfuncs.cpp#L702-L786) + zone 水位 [knl_uundozone.h:91-102](../../../../../src/include/access/ustore/undo/knl_uundozone.h#L91-L102) | **全局**(gs_stat_undo):global_recycle_xid、oldest_xmin、undo_threshold(=undo_space_limit_size×FORCE_RECYCLE_PERCENT=0.8,[knl_uundorecycle.cpp:77](../../../../../src/gausskernel/storage/access/ustore/undo/knl_uundorecycle.cpp#L77))、curr_used_undo_size、max_undo_chain_len、create/discard_undo_file_count;**Zone 级**(gs_undo_meta(0,zoneId,0) 列名 insert/discard/end/used/lsn):insertUrecPtr=写入水位、discardUrecPtr=正常回收水位(retention 驱动)、forceDiscardUrecPtr=强制丢弃水位(空间压力驱动),insert−discard 差=活 undo;**槽级**:recycleTSlotPtr/recycleXid/frozenXid(LogUndoZoneInfo 宏 [knl_uundozone.h:63-74](../../../../../src/include/access/ustore/undo/knl_uundozone.h#L63-L74) 打印全部,仅 DEBUG 日志);GUC:undo_retention_time(默认 259200s)、undo_space_limit_size(默认 256GB,guc_storage.cpp:3825) |
+| N34 | VACUUM FULL 重写路径(ustore 适配) | copy_heap_data ustore 分支 [cluster.cpp:2405-2412](../../../../../src/gausskernel/optimizer/commands/cluster.cpp#L2405-L2412) + [UHeapamRelationCopyForCluster tableam.cpp:1010](../../../../../src/gausskernel/storage/access/table/tableam.cpp#L1010) | VACUUM FULL=CLUSTER 变体([vacuum.cpp:2734](../../../../../src/gausskernel/optimizer/commands/vacuum.cpp#L2734) cluster_rel);ustore 分支:FreezeXid=当前 xid(重写后全冻结)、**OldestXmin=globalRecycleXid**(undo 水位!);数据拷贝经 tableam 分发到 CopyUHeapDataInternal——**此代码库 ustore 支持 vacuum full**;注意 [cluster.cpp:2380](../../../../../src/gausskernel/optimizer/commands/cluster.cpp#L2380) "cluster not supported in ustore" 仅在 relfrozenxid64 属性为 NULL 的旧目录兜底分支触发 |
 
 ## 二、关系边
 
@@ -74,6 +75,8 @@
 | N33 | N18 | 驱动 | discard 水位由 Recycler 推进,受 oldest_xmin/retention 约束;forceDiscard 由空间压力驱动(呼应 N17/N18) |
 | N33 | N26 | 供给 | global_recycle_xid 是旁路 VACUUM 推进 frozenxid 的输入 |
 | N33 | N14 | 界定 | insert−discard 差值即"尚未回收的 undo",与 MiniSlot 起止对应 |
+| N34 | N18 | 依赖 | 重写路径的 OldestXmin 取 globalRecycleXid——vacuum full 的判死同样受 undo 回收水位约束 |
+| N34 | N23 | 并列 | 普通 vacuum(S5 两遍式)与 vacuum full(重写式)是 ustore 空间回收的两条互补路径 |
 
 ## 三、设计取舍场景(2026-10-09 深化分析)
 
@@ -146,6 +149,12 @@
   ```
 - **判读**:① global_recycle_xid 不动 + translot 里存在老 xact → 长事务(S5/T2 机制);② curr_used_undo_size 逼近 undo_threshold → 即将强丢,关注 oldest_xmin 对应事务;③ discard_undo_file_count 增长正常回收,create−discard 差=未回收文件数
 - **注**:src/bin/libog_query/src_mock.cpp 中的 gs_undo_meta 等只是 libog_query 的 mock 桩,非真实现;真身在 pgundostatfuncs.cpp
+
+### S9 「ustore 表不支持 vacuum」观点核查(2026-10-12)
+- **结论:对该代码库不成立**。①普通 VACUUM:vacuum_rel 末尾 [vacuum.cpp:2804-2817](../../../../../src/gausskernel/optimizer/commands/vacuum.cpp#L2804-L2817) → TableRelationVacuum [:1907-1915](../../../../../src/gausskernel/optimizer/commands/vacuum.cpp#L1907-L1915) 按 RelationIsUstoreFormat 分发 LazyVacuumUHeapRel(见 S5);②VACUUM FULL:走 cluster 重写路径,ustore 适配完备(N34)
+- **观点来源考证**:[zh_CN.po:62127](../../../../../src/gausskernel/po/zh_CN.po#L62127) 残留 msgid "skipping ... Don't vacuum full ustore table, this feature to be released in the future"——**全树 grep 无对应代码**,是旧版本(early 2.x/3.0)跳过 ustore vacuum full 的陈旧翻译条目;当前源码已移除该跳过逻辑
+- **易混点**:①CLUSTER 命令(按索引聚簇)与 VACUUM FULL 共用 copy_heap_data,cluster.cpp:2380 的 ERROR 只在旧目录(relfrozenxid64 为 NULL)兜底分支;②`gs_undo_*` 观测函数在分布式模式报不支持,易被误读为 ustore 功能缺失;③ustore 索引仅限 ubtree/hnsw(indexcmds.cpp:853-862),CLUSTER 需要可用索引时间接受限
+- **方法论**:判断"某引擎不支持某操作"必须溯源到 ereport/elog 的实际触发条件,po 文件和旧文档可能滞后于代码
 
 ## 四、测试场景(2026-10-09)
 
