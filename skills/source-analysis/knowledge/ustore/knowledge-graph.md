@@ -156,6 +156,7 @@
 - **易混点**:①CLUSTER 命令(按索引聚簇)与 VACUUM FULL 共用 copy_heap_data,cluster.cpp:2380 的 ERROR 只在旧目录(relfrozenxid64 为 NULL)兜底分支;②`gs_undo_*` 观测函数在分布式模式报不支持,易被误读为 ustore 功能缺失;③ustore 索引仅限 ubtree/hnsw(indexcmds.cpp:853-862),CLUSTER 需要可用索引时间接受限
 - **方法论**:判断"某引擎不支持某操作"必须溯源到 ereport/elog 的实际触发条件,po 文件和旧文档可能滞后于代码
 - **补充(2026-10-12):lazy 路径不冻结**——[knl_uvacuumlazy.cpp:817](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L817) 注释 "we don't perform freeze operation in uheap",relfrozenxid 直接推到 oldestXmin([:831](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L831))而非物理改写元组;VACUUM FREEZE 的全量冻结语义只在 VACUUM FULL 重写路径达成(FreezeXid=当前事务)。可见性保障靠 undo 判 abort,不靠 freeze 位,与 astore 的冻结模型本质不同
+- **补充(2026-10-12):VACUUM VERBOSE 支持**——[knl_uvacuumlazy.cpp:741-745](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L741-L745) 处理 VACOPT_VERBOSE → elevel=INFO,输出 "vacuuming uheap ... oldestXmin" [:214](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L214)、"found N removable..." [:530](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L530) 等;且 oldestXmin 直接读 globalRecycleXid [:754](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L754)=VACUUM 判死基准与 undo 回收水位耦合(可与 gs_stat_undo 的 global_recycle_xid 实测对账);全库无 ustore DML 时该值可能异常打 WARNING [:758-767](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L758-L767),非故障
 
 ## 四、测试场景(2026-10-09)
 
