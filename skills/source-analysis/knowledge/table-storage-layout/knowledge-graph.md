@@ -10,7 +10,7 @@
 | N1 | 行=元组模型 | (架构) | 一行=1 tuple;超出页容量限制时由 TOAST 切块成多个 toast tuple |
 | N2 | Astore 页容量 | MaxHeapTuplesPerPage [htup.h:536](../../../../../src/include/access/htup.h#L536) | (8192−24页头)/(24头+4行指针)=**291/页**;MinHeapTupleSize=24 [htup.h:523](../../../../../src/include/access/htup.h#L523);MaxHeapTupleSize=8160 |
 | N3 | Ustore 页容量 | [knl_upage.h:203](../../../../../src/include/access/ustore/knl_upage.h#L203) | 页头 **56B**(TransactionId 为 uint64,c.h:487!)+TD区(默认4槽[rel.h:451](../../../../../src/include/utils/rel.h#L451)×16B)→(8192−56−64)/(**11+4**)=**538/页**;理论极限(8192−56)/15=542;经编译实证(sizeof 验证程序)确认 |
-| N4 | 元组头尺寸 | HeapTupleHeaderData 23B / UHeapDiskTupleData 9B([knl_utuple.h:144](../../../../../src/include/access/ustore/knl_utuple.h#L144)) | Ustore 无 xmin/xmax,头小14B;对齐均 MAXALIGN(8) |
+| N4 | 元组头尺寸 | HeapTupleHeaderData 23B / UHeapDiskTupleData **11B**([knl_utuple.h:144-156](../../../../../src/include/access/ustore/knl_utuple.h#L144-L156)) | Ustore 头字段:xid(ShortTransactionId 4B)+td_id/reserved(2B)+flag(2B)+flag2(2B)+t_hoff(1B)=11B;**勘误(2026-10-12):初版误记 9B**,sizeof 实证与字段累加均为 11B;无 null bitmap 时 astore 23B(MAXALIGN 后 24B) |
 | N5 | TOAST 阈值 | [tuptoaster.h:45-51](../../../../../src/include/access/tuptoaster.h#L45-L51) | TOAST_TUPLES_PER_PAGE=4 → TOAST_TUPLE_THRESHOLD=2032B(8K页);超过先压缩后外置 |
 | N6 | TOAST 切块 | TOAST_MAX_CHUNK_SIZE [tuptoaster.h:89](../../../../../src/include/access/tuptoaster.h#L89) | 2032−24−4−4−4=**1996B/chunk**;行占 tuple 数=1+Σceil(列长/1996);改此值需 initdb |
 | N7 | 实测工具 | contrib/pgstattuple、pageinspect | pgstattuple→每行均摊字节;pg_column_size→单行序列化尺寸;heap_page_items→逐页逐tuple;pg_relation_size fork 区分 main/toast |
@@ -41,6 +41,52 @@
 - UBTree 特化:索引条目自带 xmin/xmax(`UBTreeItupGetXminXmax` [ubtree.h:683](../../../../../src/include/access/ubtree.h#L683)),可独立判死;配套 UNDO_UBT_INSERT/DELETE 维护
 - **索引不缩容**:VACUUM 只清死条目,索引页不归还 OS(表可截尾,索引不可),真缩容靠 REINDEX
 - 与 [[tidbitmap]] S1 呼应:索引陈旧条目/损坏正是 "294" 类报错的来源
+
+### S3 存储层类型字节速查表(2026-10-12)
+
+**基础 typedef**
+
+| 类型 | 字节 | 锚点/备注 |
+|---|---|---|
+| TransactionId | 8 | c.h:487,**uint64**,openGauss 特有(PG 为 4B) |
+| ShortTransactionId | 4 | c.h:496,ustore 元组头/undo 头内使用 |
+| Oid | 4 | uint32 |
+| ItemPointerData(ctid) | 6 | itemptr.h:块号 4B + 槽号 2B |
+| CSN | 8 | uint64 |
+| UndoRecPtr | 8 | [knl_uundotype.h:26](../../../../../src/include/access/ustore/undo/knl_uundotype.h#L26),uint64 |
+| UndoRecordSize | 2 | 同上 :29,uint16 |
+
+**页面级(8K 页)**
+
+| 结构 | 字节 | 备注 |
+|---|---|---|
+| Astore PageHeaderData | 24 | bufpage.h |
+| Ustore UHeapPageHeaderData | 56 | sizeof 实证;多出的 32B 主要是 undo 相关字段 |
+| TD 槽 | 16/槽 | xactid 8B + UndoRecPtr 8B;默认 4 槽=64B |
+| ItemIdData(行指针) | 4/个 | astore/ustore 通用 |
+| MiniSlot(事务槽,undo) | 24 | endUndoPtr 8 + startUndoPtr 8 + xactid 8 [knl_uundotype.h:170-173](../../../../../src/include/access/ustore/undo/knl_uundotype.h#L170-L173) |
+
+**元组级**
+
+| 结构 | 字节 | 备注 |
+|---|---|---|
+| HeapTupleHeaderData(astore) | 23(+null bitmap) | MAXALIGN 后 24;MinHeapTupleSize=24 |
+| UHeapDiskTupleData(ustore) | 11 | 4+2+2+2+1;加上 ItemId 共 15B → 538/页 |
+
+**undo 记录组件([knl_uundorecord.h:34-137](../../../../../src/include/access/ustore/knl_uundorecord.h#L34-L137),字节数取自内核宏注释)**
+
+| 组件 | 字节 | 何时出现 |
+|---|---|---|
+| UndoRecordHeader | 22 | 每条必有:xid 8+cid 4+reloid 4+relfilenode 4+utype 1+uinfo 1 |
+| UndoRecordBlock | 14 | 目标块定位:blkprev 8+blkno 4+offset 2 |
+| UndoRecordTransaction | 8 | prevurp 链 |
+| UndoRecordOldTd | 8 | TD 覆盖时记旧 xactid |
+| UndoRecordPartition/Tablespace | 4 | 分区/表空间场景 |
+| UndoRecordPayload | 2+数据 | payloadlen 2B + 实际载荷(如 DELETE 的旧元组) |
+
+**示例:一条 ustore DELETE 的 undo 记录** ≈ Header 22 + Block 14 + Transaction 8 + OldTd 8 + Payload 2 + 旧元组数据 → 固定开销 54B;INSERT 无旧元组,固定开销 ≈ 46B(无 OldTd)。频繁短事务小事务的 undo 放大按此估算。
+
+**TOAST 常量**(N5/N6):触发阈值 astore 2032B / ustore 2008B;chunk 1996B;例:10240B text → 1 主壳 + 6 chunk = 7 tuple。
 
 ## 四、待深入
 
