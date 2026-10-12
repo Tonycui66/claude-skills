@@ -38,7 +38,8 @@
 | N29 | 扫描接口面 | TableAmRoutine [tableam.cpp:1161](../../../../../src/gausskernel/storage/access/table/tableam.cpp#L1161) + [knl_uscan.h:26](../../../../../src/include/access/ustore/knl_uscan.h#L26) | 一套 TableScanDesc 接口承载多模式:scan_begin(顺序)/begin_bm(位图)/begin_sampling(TABLESAMPLE)/begin_parallel(并行)/index_fetch_*(索引回表)/tuple_fetch_row_version(TID 扫描);UHeapScanDescData 用 rs_bitmapscan/rs_samplescan/rs_parallel/dop 标志复用同一机制 |
 | N30 | DML 的 undo 生成点 | Insert→UHeapPrepareUndoInsert [knl_uheap.cpp:646](../../../../../src/gausskernel/storage/access/ustore/knl_uheap.cpp#L646)/MultiInsert [:3510](../../../../../src/gausskernel/storage/access/ustore/knl_uheap.cpp#L3510);Delete→UHeapPrepareUndoDelete [:2227](../../../../../src/gausskernel/storage/access/ustore/knl_uheap.cpp#L2227) | **每条 INSERT/DELETE/原位 UPDATE 都写 undo**:insert 记录"新插入"事实(回滚删除+abort 判定),delete/update 保存旧元组数据;频繁 DML ⇒ undo 线性增长,至 undo_retention_time 过期由 Recycler 回收 |
 | N31 | undo 链的物理形态 | GetPrevUrp [knl_uundoapi.cpp:749](../../../../../src/gausskernel/storage/access/ustore/undo/knl_uundoapi.cpp#L749) + GetPrevRecordLen [knl_uundorecord.cpp:201](../../../../../src/gausskernel/storage/access/ustore/knl_uundorecord.cpp#L201) | 同一事务的 undo 记录在 log 中**物理连续**:每条记录尾部存前一条的长度(2B),回溯 = 当前偏移−prevLen;页上 TD 槽(16B:xactid+UndoRecPtr)指向该事务在该页的最新记录,由此进入链头;跨事务版本链靠 DELETE/UPDATE 记录携带的 TD 信息(need_old_xact_info)串接 |
-| N32 | undo 观测函数族 | [pgundostatfuncs.cpp](../../../../../src/common/backend/utils/adt/pgundostatfuncs.cpp)(单机模式,分布式报不支持) | gs_stat_undo(全局水位)/gs_undo_meta(zone 级 insert/update/delete 计数)/gs_undo_translot(事务槽列表)/gs_undo_translot_dump_xid(按 xid 走链)/gs_undo_dump_record·gs_undo_dump_xid(逐记录 dump)/gs_undo_dump_parsepage_mv(页面 MVCC 解析);用法样例:src/test/regress/sql/test_ustore_undo_tool.sql |
+| N32 | undo 观测函数族 | [pgundostatfuncs.cpp](../../../../../src/common/backend/utils/adt/pgundostatfuncs.cpp)(单机模式,分布式报不支持) | gs_stat_undo(全局水位)/gs_undo_meta(zone 级水位)/gs_undo_translot(事务槽列表)/gs_undo_translot_dump_xid(按 xid 走链)/gs_undo_dump_record·gs_undo_dump_xid(逐记录 dump)/gs_undo_dump_parsepage_mv(页面 MVCC 解析);签名均为数字参数:**gs_undo_meta(type,zoneId,location)** type∈{0=zone,1=translot组,2=undoSpace,3=slotSpace} location∈{0=共享内存,1=磁盘};**gs_undo_translot(type,zoneId)**;用法样例:src/test/regress/sql/test_ustore_undo_tool.sql |
+| N33 | undo 水位体系 | gs_stat_undo 列 [pgundostatfuncs.cpp:702-786](../../../../../src/common/backend/utils/adt/pgundostatfuncs.cpp#L702-L786) + zone 水位 [knl_uundozone.h:91-102](../../../../../src/include/access/ustore/undo/knl_uundozone.h#L91-L102) | **全局**(gs_stat_undo):global_recycle_xid、oldest_xmin、undo_threshold(=undo_space_limit_size×FORCE_RECYCLE_PERCENT=0.8,[knl_uundorecycle.cpp:77](../../../../../src/gausskernel/storage/access/ustore/undo/knl_uundorecycle.cpp#L77))、curr_used_undo_size、max_undo_chain_len、create/discard_undo_file_count;**Zone 级**(gs_undo_meta(0,zoneId,0) 列名 insert/discard/end/used/lsn):insertUrecPtr=写入水位、discardUrecPtr=正常回收水位(retention 驱动)、forceDiscardUrecPtr=强制丢弃水位(空间压力驱动),insert−discard 差=活 undo;**槽级**:recycleTSlotPtr/recycleXid/frozenXid(LogUndoZoneInfo 宏 [knl_uundozone.h:63-74](../../../../../src/include/access/ustore/undo/knl_uundozone.h#L63-L74) 打印全部,仅 DEBUG 日志);GUC:undo_retention_time(默认 259200s)、undo_space_limit_size(默认 256GB,guc_storage.cpp:3825) |
 
 ## 二、关系边
 
@@ -70,6 +71,9 @@
 | N31 | N14 | 寻址 | 链的起止由事务槽(MiniSlot)的 start/end URP 界定 |
 | N32 | N31 | 解析 | dump 函数复用 GetPrevUrp 走链逻辑 |
 | N32 | N18 | 观测 | gs_undo_meta/translot 反映 Recycler 回收进度 |
+| N33 | N18 | 驱动 | discard 水位由 Recycler 推进,受 oldest_xmin/retention 约束;forceDiscard 由空间压力驱动(呼应 N17/N18) |
+| N33 | N26 | 供给 | global_recycle_xid 是旁路 VACUUM 推进 frozenxid 的输入 |
+| N33 | N14 | 界定 | insert−discard 差值即"尚未回收的 undo",与 MiniSlot 起止对应 |
 
 ## 三、设计取舍场景(2026-10-09 深化分析)
 
@@ -115,17 +119,33 @@
   ```sql
   -- ① 全局水位与回收状态
   SELECT * FROM gs_stat_undo();
-  -- ② zone 级计数(注意 insert/update/delete 计数与空间占用)
-  SELECT * FROM gs_undo_meta(0, true, true);
-  -- ③ 事务槽列表:每个产生 DML 的 xact 一行(xid/起止 URP)
-  SELECT * FROM gs_undo_translot(0, true);
+  -- ② zone 级水位(insert/discard/end/used/lsn;第2参 -1 表全部 zone)
+  SELECT * FROM gs_undo_meta(0, -1, 0);
+  -- ③ 事务槽列表:每个产生 DML 的 xact 一行(xid/起止 URP;第1参 0=共享内存 1=磁盘)
+  SELECT * FROM gs_undo_translot(0, -1);
   -- ④ 按事务走链:从该 xact 最新记录回溯列出全部 undo 记录
   SELECT * FROM gs_undo_dump_xid(<xid>);
-  -- ⑤ 单条记录内容(类型、目标页/offset、旧元组)
-  SELECT * FROM gs_undo_dump_record(<urp>);
+  -- ⑤ 单条记录内容(xid/cid/reloid/utype/blockno/prevurp/payloadlen)
+  SELECT * FROM gs_undo_record(<urp>);
+  ```
+  **勘误**(2026-10-12):初版把 ②③ 参数写成布尔。实签名:`gs_undo_meta(type, zoneId, metaLocation)`,type∈{0=zone,1=translot组,2=undoSpace,3=slotSpace},metaLocation∈{0=共享内存,1=磁盘};`gs_undo_translot(type, zoneId)`
   ```
 - **演示**:会话 A `BEGIN;` 循环 INSERT+DELETE 不提交 → 会话 B 查 ②③ 可见本 xact 的 undo 增长;A 回滚后可见性靠这些 undo 判 abort(呼应 S3 回滚廉价);A 提交等待 retention 过期后再查 ②,计数回落
 - **回归样例**:`src/test/regress/sql/test_ustore_undo_tool.sql`(undo 工具函数用法全集)
+
+### S8 undo 水位线的获取与健康判读(2026-10-12)
+- **三级水位**(N33):全局(gs_stat_undo)/Zone 级(gs_undo_meta type=0,列 insert/discard/end/used/lsn)/槽级(allocateTSlotPtr/recycleTSlotPtr/recycleXid,仅 DEBUG 日志 LogUndoZoneInfo 输出)
+- **水位语义**:insert=写入头,discard=正常回收尾(retention 到期后 Recycler 推进),end(forceDiscard)=强制丢弃尾(used 超 undo_threshold=undo_space_limit_size×0.8 时推进,丢弃未过期 undo,读旧版本报 snapshot too old,呼应 S4);回收边界受 GetGlobalOldestXmin 约束——**discard 卡住不动 ⇒ 有长事务**
+- **监控 SQL**:
+  ```sql
+  -- 全局:global_recycle_xid 是否前进、curr_used_undo_size 与 undo_threshold 的距离
+  SELECT global_recycle_xid, oldest_xmin, curr_used_undo_size, undo_threshold,
+         create_undo_file_count, discard_undo_file_count FROM gs_stat_undo();
+  -- 各 zone 活 undo 量(insert−discard):差值持续增大 = 回收跟不上
+  SELECT * FROM gs_undo_meta(0, -1, 0);
+  ```
+- **判读**:① global_recycle_xid 不动 + translot 里存在老 xact → 长事务(S5/T2 机制);② curr_used_undo_size 逼近 undo_threshold → 即将强丢,关注 oldest_xmin 对应事务;③ discard_undo_file_count 增长正常回收,create−discard 差=未回收文件数
+- **注**:src/bin/libog_query/src_mock.cpp 中的 gs_undo_meta 等只是 libog_query 的 mock 桩,非真实现;真身在 pgundostatfuncs.cpp
 
 ## 四、测试场景(2026-10-09)
 
