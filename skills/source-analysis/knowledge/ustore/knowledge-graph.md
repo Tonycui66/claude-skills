@@ -155,6 +155,7 @@
 - **观点来源考证**:[zh_CN.po:62127](../../../../../src/gausskernel/po/zh_CN.po#L62127) 残留 msgid "skipping ... Don't vacuum full ustore table, this feature to be released in the future"——**全树 grep 无对应代码**,是旧版本(early 2.x/3.0)跳过 ustore vacuum full 的陈旧翻译条目;当前源码已移除该跳过逻辑
 - **易混点**:①CLUSTER 命令(按索引聚簇)与 VACUUM FULL 共用 copy_heap_data,cluster.cpp:2380 的 ERROR 只在旧目录(relfrozenxid64 为 NULL)兜底分支;②`gs_undo_*` 观测函数在分布式模式报不支持,易被误读为 ustore 功能缺失;③ustore 索引仅限 ubtree/hnsw(indexcmds.cpp:853-862),CLUSTER 需要可用索引时间接受限
 - **方法论**:判断"某引擎不支持某操作"必须溯源到 ereport/elog 的实际触发条件,po 文件和旧文档可能滞后于代码
+- **补充(2026-10-12):lazy 路径不冻结**——[knl_uvacuumlazy.cpp:817](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L817) 注释 "we don't perform freeze operation in uheap",relfrozenxid 直接推到 oldestXmin([:831](../../../../../src/gausskernel/storage/access/ustore/knl_uvacuumlazy.cpp#L831))而非物理改写元组;VACUUM FREEZE 的全量冻结语义只在 VACUUM FULL 重写路径达成(FreezeXid=当前事务)。可见性保障靠 undo 判 abort,不靠 freeze 位,与 astore 的冻结模型本质不同
 
 ## 四、测试场景(2026-10-09)
 
