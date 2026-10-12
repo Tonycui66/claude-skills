@@ -160,7 +160,7 @@
 
 ## 四、测试场景(2026-10-09)
 
-T1-T8 测试集见 [tests/ustore_vacuum_test.sql](tests/ustore_vacuum_test.sql),与 S5 机制一一对应:
+T1-T8 测试集见 [tests/ustore_vacuum_test.sql](tests/ustore_vacuum_test.sql),与 S5 机制一一对应;S9 结论验证用例 T9-T13 见 [tests/ustore_vacuum_verify.sql](tests/ustore_vacuum_verify.sql)(VERBOSE+水位对账/undo 增长回落/vacuum full 版本判定/freeze 语义/长事务耦合):
 
 | 场景 | 验证机制 | 关键观测 |
 |---|---|---|
